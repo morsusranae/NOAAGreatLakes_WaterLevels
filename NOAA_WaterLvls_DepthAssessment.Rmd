@@ -1,0 +1,432 @@
+---
+title: "NOAA_WaterLvls_DepthAssessment"
+author: "Louis Jochems"
+date: "2024-04-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The purpose of this script is to retrieve daily, monthly, and weekly water levels (elevation in meters) from nearby NOAA gauge stations on the Great Lakes (GL). We then add these values from the nearest station to each field observation throughout the St Marys River, MI from 2015-2023. We need these water levels to:
+    a) calculate water depth and use these depth values as an input variable for a species distribution        model (SDM) that predicts suitable habitat for the invasive aquatic plant, European frogbit (EFB;        Hydrocharis morsus-ranae L)
+    b) create two geospatial layers, water level and water depth (the difference of GL water level and         underlying topobathymetric elevation), that will be used to constrain and map predictions of            sutiable habitat all throughout the study area. 
+
+EFB is found in coastal and inland wetland plant communities throughout the Great Lakes region. However, GL coastal wetlands are dynamic ecosystems, meaning that they fluctuate in community composition from year to year, largely due to varying water levels of the GL basin (due to natural fluctuations but more recently, extremes due to climate change; see work by Drew Gronewold). It is important to incorporate this dynamism into SDMs so that we can more accurately predict suitable habitat for EFB from year to year.
+
+```{r packages}
+options("sp_evolution_status" = 2)
+library(sp)
+library(sf)
+library(terra)
+
+library(sdm)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(basemaps)
+library(leaflet)
+#library(ggmap)
+library(lubridate)
+library(ggsn)
+library(viridis)
+library(readr)
+
+#rnoaa package to retrieve water levels from gauge stations 
+library(rnoaa)
+```
+
+```{r folder & data}
+# Set directory where point shape files are located 
+setwd("~/R/NOAAGreatLakes_WaterLevels")
+#setwd("~/path/to/project/data")
+
+# Read the full point dataset
+sm_all <- read.csv("StMarysPts2015_23_FINAL_COMPLETE.csv")
+
+# Read the point dataset with only extracted DEM values (important for later)
+sm_dems <- read.csv("SM15_23ALLDEMs_NEW.csv")
+
+#NOTE to CK: I generated this DEM dataframe in Arc bc it was easier for me to extract the merged DEMs 
+#there since Arc was available on a higher performing computer at BSU. So I don't have any R code for how to sample
+#DEM values to points, BUT I could create a example of that workflow in an RMD file if you'd find that useful... 
+#let me know! 
+
+```
+
+Loading in core packages for this project. Reading in necessary field data sets for the project as well. We have one that contains all field observations of EFB occurrence in our study area, the St. Mary's River corridor in the Upper Peninsula, MI, USA, from 2015 - 2023. The other is the same points but only with extracted values from the following DEMs: NOAA Digital Coast LIDAR, USGS 3DEP 1m national (unprojected), and USGS (projected to same UTM as NOAA). We will join these values to the main dataframe so that we can then take the difference between the NOAA water levels and the topobathymetry/DEM to get a water depth column. 
+
+Next, we use the coops_search() function in the rnoaa package to pull in daily mean water levels from the nearby gauge stations in the St Mary's study area. I selected the six closest stations to the majority of the field observations in St Mary's. Use this link to find gauge station and their station IDs on NOAA's tides and currents website: <https://tidesandcurrents.noaa.gov/stations.html?type=Water+Levels>
+
+The for loop goes through the station ID's and pulls daily water levels from June 1st to September 30th (growing season for the region) each year: 
+
+```{r rnoaa dailies, echo=FALSE}
+#for loop that grabs data from six gauge stations throughout the study area 
+#station ids 
+#rock cut: 9076024
+#neebish island: 9076027 (next to rock cut)
+#detour village: 9075099
+#mackinaw city: 9075080
+#us slip: 9076060
+#little rapids: 9076033 (next to us slip in Sault St Marie)
+
+station_ids <- list("9076024", "9076027", "9075099", "9075080", "9076033") 
+results <-  list()
+
+for (sid in unique(station_ids)) {
+  for(year in 2015:2023){ 
+      data <- coops_search(station_name = sid, 
+                   begin_date = paste0(year,'0601'), 
+                   end_date = paste0(year, '0930'), #growing season 
+                   datum = "stnd",
+                   product ="daily_mean", 
+                   units = "metric",
+                   time_zone = "lst", #took out _ldt for dailies, wouldn't work but see documentation 
+                   application = "rnoaa")
+      #add station metadata
+      data$data$station <- data$metadata$name
+      data$data$gps_lat <- data$metadata$lat
+      data$data$gps_lon <- data$metadata$lon
+      data$data$station_num <- data$metadata$id
+      #store data in a list 
+      results[[length(results) + 1]] <- data #repeat for each station 
+  }
+} 
+
+#extract each list element and combine into one big df 
+dailies <- lapply(results, function(x) x$data) 
+daily_df <- do.call(rbind, dailies) %>% 
+  dplyr::select(-f) #drop odd column, 0,0 value for all cells 
+names(daily_df)[1:2] <- c("date", "daily_mean") #rename columns to more meaningful names
+
+#extract year and month/date as separate columns for ggplot below 
+daily_df$year <- year(daily_df$date)
+daily_df$md <- format(daily_df$date, "%m-%d")
+
+```
+
+Here's a quick plot to check the time series of daily water levels for each station by each year in study period: 
+```{r time series plot of daily water levels of study period}
+ggplot(daily_df, aes(x = md, y = daily_mean, group = station, color = station)) + 
+  geom_line() +
+  geom_smooth(method = "loess") + 
+  facet_grid(~year)
+
+```
+
+```{r leaflet map to examine how close points are to the stations}
+#make a station sf (simple feature) real quick 
+station_name <- unique(daily_df$station)
+gps_lat <- unique(daily_df$gps_lat)
+gps_lon <- unique(daily_df$gps_lon)
+
+station_df <- cbind(station_name,gps_lat,gps_lon) %>% 
+  as.data.frame()
+
+#make gauge station shape file for making figure 
+station_sf <- st_as_sf(station_df, 
+                       coords = c("gps_lon","gps_lat"), crs = 4326)
+#make gauge station shape file for making figure 
+#st_write(station_sf, "GaugeStations.shp")
+
+#make of field observations sf 
+sm_sf <- st_as_sf(sm_all, coords = c("GPS_Lon", "GPS_Lat"), crs = 4326)
+
+#extra packages for leaflet 
+library(htmlwidgets)
+library(htmltools)
+library(leaflet.extras)
+
+north.arrow.file <- "<img src = 'https://upload.wikimedia.org/wikipedia/commons/a/aa/Aiga_uparrow.svg' style='width:40px;height:60px;'>"
+
+map1 <- leaflet(sm_sf) %>% 
+  addProviderTiles('Esri.WorldImagery') %>%
+  addMarkers(popup = ~hyd_bin) %>%
+  addScaleBar(position="bottomright") %>% 
+  addControl(html=north.arrow.file,
+             position="bottomleft",
+             className="fieldset{}") %>%
+  addMiniMap()
+
+map2 <- leaflet(station_sf) %>% 
+  addProviderTiles('Esri.WorldImagery') %>%
+  addMarkers(popup = ~station_name) %>%
+  addScaleBar(position="bottomright") %>% 
+  addControl(html=north.arrow.file,
+             position="bottomleft",
+             className="fieldset{}") %>%
+  addMiniMap()
+ 
+# Arrange the maps side by side manually in an HTML layout
+div(
+  div(map1, style = "width: 50%; float: left;"),
+  div(map2, style = "width: 50%; float: left;")
+)
+
+```
+Looks like a handful of points are fairly close to Little Rapids with elevated water levels. Keep in mind for later. May need to unpack this further for manuscript.  
+
+For now, we will extract monthly water levels to all observations.
+
+```{r grab monthly water readings from stations}
+#same stations as above 
+# Initialize a new list to store monthly results
+results_monthly <- list()
+
+# Loop through each station and year to fetch monthly data
+for (sid in unique(station_ids)) {
+  for (year in 2015:2023) { 
+    data <- coops_search(
+      station_name = sid, 
+      begin_date = paste0(year, '0601'), 
+      end_date = paste0(year, '0930'), 
+      datum = "stnd",
+      product = "monthly_mean", # Fetch monthly means
+      units = "metric",
+      time_zone = "lst", 
+      application = "rnoaa")
+    # Add station metadata to the data
+    data$data$station <- data$metadata$name
+    data$data$gps_lat <- data$metadata$lat
+    data$data$gps_lon <- data$metadata$lon
+    data$data$station_num <- data$metadata$id
+    # Store data in a list
+    results_monthly[[length(results_monthly) + 1]] <- data #repeat for all stations 
+  }
+} 
+
+# Extract and combine into one big dataframe 
+monthlies <- lapply(results_monthly, function(x) x$data) 
+monthly_df <- do.call(rbind, monthlies) %>% 
+  select(-c(MHHW, MHW, MTL, MLW, MLLW, DTL, GT, MN, DHQ, DLQ, HWI, LWI, inferred)) # Drop columns with NA values 
+
+```
+
+Now that we have grabbed daily and monthly water levels, we can calculate nearest neighbor distances for all field observations to the station locations.
+
+```{r aggregate station to means & calculate nearest neighbor distances}
+library(FNN)
+
+#station means will be quickest for calculating NN (presumably)
+#using monthly df because it doesn't really matter for FNN function 
+#station coords the same for monthly or daily 
+monthly_means <- aggregate(cbind(highest, MSL,lowest) ~
+                            station + gps_lat + gps_lon,
+                           data = monthly_df, mean)
+
+monthly_means$ID <- 1:5 #going with five stations now, excluded "US Slip"
+
+#make gps_lat, gps_lon numeric, NOT characters (necessary for nn function)
+monthly_means <- monthly_means %>% 
+  mutate(gps_lat = as.numeric(gps_lat),
+         gps_lon = as.numeric(gps_lon))
+
+fnn <- as.data.frame(get.knnx(monthly_means[,c(3, 2)],
+                              sm_all[,c(11, 12)],
+                              k = 4))
+#REMEMBER coord order make sure they match up: long then lat 
+#output is in dec degrees, but shouldn't matter? 
+#k = 4 nearest neighbors 
+
+#append nearest station index to main df 
+sm_all$station_id <- fnn$nn.index.1
+
+#Code below commented out just because it was a test for the daily df 
+#I think it will be the same nearest station IDs for dailies, but would like to double check 
+# daily_means <- aggregate(daily_mean ~
+#                             station + gps_lat + gps_lon,
+#                            data = daily_df, mean)
+# daily_means$ID <- 1:6 #six stations now 
+# 
+# #make gps_lat, gps_lon numeric, not characters (necessary for nn function)
+# daily_means <- daily_means %>% 
+#   mutate(gps_lat = as.numeric(gps_lat),
+#          gps_lon = as.numeric(gps_lon))
+# 
+# fnn_daily <- as.data.frame(get.knnx(daily_means[,c(3,2)], sm_all[,c(10,11)], k=4))
+# 
+# identical(fnn,fnn_daily)
+#[1] TRUE
+#confirmed 
+
+```
+
+Since we've attached the index of the nearest station to each point in the main dataframe, we can then do an inner_join of the fnn objects to the dataframe and get the monthly/daily water levels for each station. 
+
+```{r append corresponding daily and monthly water levels to obs}
+######------dailies------###### 
+#add station id column for matching and joining 
+daily_df$station_id <- NA %>% 
+  as.double()
+
+# Add new station indices to daily_df
+daily_df <- daily_df %>% 
+  mutate(
+    station_id = case_when(
+      station == "De Tour Village" ~ 1,
+      station == "Rock Cut" ~ 2,
+      station == "West Neebish Island" ~ 3,
+      station == "Mackinaw City" ~ 4,
+      station == "Little Rapids" ~ 5,
+      TRUE ~ station_id  # Keep station_id unchanged for other stations
+    )
+  )
+#now try inner_join, should work based on date alone 
+#make station id in main df numeric 
+sm_all$station_id <- as.numeric(sm_all$station_id)
+
+sm_all$date <- as.Date(sm_all$date)
+daily_df$date <- as.Date(daily_df$date)
+
+#join dailies to main df 
+sm_all_wl <- dplyr::inner_join(sm_all, daily_df, by = c("station_id", "date"))
+
+#need to rename, drop, and wrangle some columns to avoid confusion 
+sm_all_wl <- sm_all_wl %>% 
+  select(-c(Station, Year)) #drop old Station column bc doesn't contain '23 data, Year is redundant 
+
+#####------ onto monthly's -----###### 
+#add station id column for matching and joining 
+monthly_df$station_id <- NA %>% 
+  as.double()
+
+# Add new station indices to monthly_df
+monthly_df <- monthly_df %>% 
+  mutate(
+    station_id = case_when(
+      station == "De Tour Village" ~ 1,
+      station == "Rock Cut" ~ 2,
+      station == "West Neebish Island" ~ 3,
+      station == "Mackinaw City" ~ 4,
+      station == "Little Rapids" ~ 5,
+      TRUE ~ station_id  # Keep station_id unchanged for other stations
+    )
+  )
+
+sm_all_wl <- dplyr::inner_join(sm_all_wl, monthly_df,
+                                    by = c("station_id", "month", "year"))
+#now we have daily means, as well as highest/lowest & mean MONTHLY water levels for each point. nice! 
+
+#more wrangling 
+sm_all_wl <- sm_all_wl %>% 
+  select(-c(station.y, gps_lat.y, gps_lon.y, station_num.y, X.2)) #drop redundant columns 
+
+#rename some columns to avoid confusion 
+names(sm_all_wl)[59:63] <- c("Daily_WL","NOAA_Station","station_lat",
+                             "station_lon","station_num")
+names(sm_all_wl)[66:68] <- c("HWL_Monthly","MWL_Monthly","LWL_Monthly") #high, mean, low 
+
+```
+
+The relevant water levels are now added to the main dataframe of EFB observations. Next, we need to add DEM values to this dataframe, calculate water depth by taking the difference of the NOAA water level and the DEM value. 
+
+```{r append DEMs to main df & calculate depth, and a few other things}
+#first name columns in dem df 
+names(sm_dems)[c(2:7)] <- c("X.1", "GPS_Lon", "GPS_Lat",
+                            "Topobathymetry","Elev_unproj","Elev_proj")
+
+#drop the old dem columns in main df 
+sm_all_wl <- sm_all_wl %>% 
+  select(-c(dem_source,Topobathymetry,elevation,Topo_DEM,
+            High_WL,Mean_WL,Low_WL,Final_HD,Final_MD,Final_LD))
+
+#reorder columns
+sm_all_wl <- sm_all_wl %>% 
+  select(
+    X.1, X, OID_1, date, year, month, md, source, Lon_UTM, Lat_UTM, GPS_Lon, GPS_Lat, dst_typ, humn_md, hyd_bin, 
+    EFB_cover, phrg_bn, tg_bin, typ_bin, typ_cvr, emrg_bin, water_depth, Near_Dist, MeanFetch, MeanREI, SummerNDVI, 
+    SummerNDWI, SummerVH_mean, SummerVH_VV_mean, SummerVV_mean, correctedVH, correctedVV, correctedVVVH, correctedVHVV, 
+    smoothVH, smoothVHVV, smoothVV, waypoint, veg_zone, dom_spp, dom_cov, sec_spp, sec_cov, notes, 
+    ORG_DEP, SCH_D, TYP_D, station_id, Daily_WL, NOAA_Station, station_lat, station_lon, station_num, HWL_Monthly, 
+    MWL_Monthly, LWL_Monthly
+  )
+#drop gps_elev & unit columns. Not very useful
+
+#now add dems to main df, join by unique ID X.1 
+sm_wldems <- left_join(sm_all_wl, sm_dems, 
+                       by = c("X.1"))
+#gps don't quite match (even though they do by the eye?)
+#maybe bc arcgis spat out not quite same coords when 
+#extracting DEMs to new df? keep in mind 
+  
+#dem source column 
+sm_wldems$dem_source <- ifelse(sm_wldems$Topobathymetry > 0, 
+                               "NOAA_USACE", NA)
+sm_wldems$dem_source <- ifelse(is.na(sm_wldems$dem_source) & sm_wldems$Elev_unproj > 0,
+                               "USGS", sm_wldems$dem_source) 
+#sm_wldems %>% count(dem_source)
+#47 missing either dem source, but will just leave em for now 
+
+#make final dem/topo column 
+sm_wldems$Topo_DEM <- sm_wldems$Topobathymetry 
+#add projected elevation bc it has no zeros 
+sm_wldems$Topo_DEM <- ifelse(sm_wldems$Topo_DEM == -9999.0000, sm_wldems$Elev_proj,
+                             sm_wldems$Topo_DEM)
+#will still assess unprojected though 
+
+#make all -9999's into NAs. probably better this way 
+sm_wldems[sm_wldems == -9999.0000] <- NA
+
+#create final depth for each water level: highest, mean, lowest monthly,
+#AND DAILY... minus Topo_DEM
+sm_wldems <- sm_wldems %>% 
+  mutate(Monthly_HD = HWL_Monthly - Topo_DEM) %>%
+  mutate(Monthly_MD = MWL_Monthly - Topo_DEM) %>% 
+  mutate(Monthly_LD = LWL_Monthly - Topo_DEM) %>% 
+  mutate(Daily_D = Daily_WL - Topo_DEM) 
+
+# > nrow(sdm_usgs[which(sdm_usgs$Monthly_HD > 0),])
+# [1] 1017
+# > nrow(sdm_usgs[which(sdm_usgs$Final_MD > 0),])
+# [1] 939
+# > nrow(sdm_usgs[which(sdm_usgs$Final_LD > 0),])
+# [1] 788
+
+#drop a few more extraneous columns 
+sm_wldems <- sm_wldems %>% 
+  select(-c(waypoint,OID_,GPS_Lon.y,GPS_Lat.y))
+
+# make a new typha column for assessment purposes 
+# rework typha density column 
+sm_wldems$TYP_D <- ifelse(is.na(sm_wldems$TYP_D) | sm_wldems$TYP_D == "N/A", 0,
+                          sm_wldems$TYP_D) %>% as.numeric()
+
+sm_wldems$typ_total <- sm_wldems$typ_cvr + as.integer(sm_wldems$TYP_D)
+# still get NA's to zero in final column 
+# write.csv(sm_wldems,"StMarysALL_wRSDepths.csv")
+
+```
+
+We now have a dataframe with highest, mean, lowest monthly water depths, as well as daily mean water depths for each point. Now look at relationships of these RS derived depths with in situ depths. 
+
+```{r make cor plot wd}
+library(ggpubr) #need for ggscatter() 
+
+depths_noaa <- sm_wldems %>% 
+  filter(dem_source == "NOAA_USACE") %>% 
+  filter(!is.na(water_depth)) %>% 
+  filter(Monthly_HD > -0.5)
+
+#set as zero for all depths 
+pos_func <- function(x) {
+  x$Monthly_HD<- ifelse(x$Monthly_HD < 0, 0, x$Monthly_HD)
+  x$Monthly_MD <- ifelse(x$Monthly_MD < 0, 0, x$Monthly_MD)
+  x$Monthly_LD <- ifelse(x$Monthly_LD < 0, 0, x$Monthly_LD)
+  return(x)
+}
+
+depth <- pos_func(depths_noaa) 
+depth$water_depth <- as.numeric(depth$water_depth)
+depth$water_depth <- (depth$water_depth)/100
+
+wd_plot <- ggscatter(depth, x = "Monthly_HD",
+                     y = "water_depth", add = "reg.line", conf.int = TRUE,
+                     cor.coef = TRUE, cor.method = "pearson",
+                     xlab = "Water Depth (m, Exracted RS)",
+                     ylab = "in situ Water Depth (m)",na.rm = TRUE) 
+
+wd_plot
+
+```
+The RS and in situ RS depths show a positive linear relationship!
